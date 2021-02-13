@@ -156,13 +156,20 @@ defmodule PlausibleWeb.Api.ExternalController do
   end
 
   defp visitor_country(conn) do
-    result =
-      PlausibleWeb.RemoteIp.get(conn)
-      |> Geolix.lookup()
-      |> Map.get(:country)
+    cf_geo = PlausibleWeb.CloudflareGeo.get(conn)
 
-    if result && result.country do
-      result.country.iso_code
+    if cf_geo do
+      cf_geo
+    else
+      Logger.info("No cloudflare geo")
+      result =
+        PlausibleWeb.RemoteIp.get(conn)
+        |> Geolix.lookup()
+        |> Map.get(:country)
+
+      if result && result.country do
+        result.country.iso_code
+      end
     end
   end
 
