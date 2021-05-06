@@ -2,6 +2,7 @@ defmodule Plausible.Stats.Clickhouse do
   use Plausible.Repo
   use Plausible.ClickhouseRepo
   alias Plausible.Stats.Query
+  use Plausible.Stats.Fragments
   @no_ref "Direct / None"
 
   def compare_pageviews_and_visitors(site, query, {pageviews, visitors}) do
@@ -23,9 +24,11 @@ defmodule Plausible.Stats.Clickhouse do
     end
   end
 
-  def calculate_plot(site, %Query{step_type: "month"} = query) do
+  def calculate_plot(site, %Query{interval: "month"} = query) do
+    n_steps = Timex.diff(query.date_range.last, query.date_range.first, :months)
+
     steps =
-      Enum.map((query.steps - 1)..0, fn shift ->
+      Enum.map(n_steps..0, fn shift ->
         Timex.now(site.timezone)
         |> Timex.beginning_of_month()
         |> Timex.shift(months: -shift)
@@ -37,7 +40,7 @@ defmodule Plausible.Stats.Clickhouse do
         from e in base_query_w_sessions(site, query),
           select:
             {fragment("toStartOfMonth(toTimeZone(?, ?)) as month", e.timestamp, ^site.timezone),
-             fragment("uniq(?)", e.user_id)},
+             uniq(e.user_id)},
           group_by: fragment("month"),
           order_by: fragment("month")
       )
@@ -54,7 +57,7 @@ defmodule Plausible.Stats.Clickhouse do
     {plot, labels, present_index}
   end
 
-  def calculate_plot(site, %Query{step_type: "date"} = query) do
+  def calculate_plot(site, %Query{interval: "date"} = query) do
     steps = Enum.into(query.date_range, [])
 
     groups =
@@ -62,7 +65,7 @@ defmodule Plausible.Stats.Clickhouse do
         from e in base_query_w_sessions(site, query),
           select:
             {fragment("toDate(toTimeZone(?, ?)) as day", e.timestamp, ^site.timezone),
-             fragment("uniq(?)", e.user_id)},
+             uniq(e.user_id)},
           group_by: fragment("day"),
           order_by: fragment("day")
       )
@@ -78,7 +81,7 @@ defmodule Plausible.Stats.Clickhouse do
     {plot, labels, present_index}
   end
 
-  def calculate_plot(site, %Query{step_type: "hour"} = query) do
+  def calculate_plot(site, %Query{interval: "hour"} = query) do
     steps = 0..23
 
     groups =
@@ -86,7 +89,7 @@ defmodule Plausible.Stats.Clickhouse do
         from e in base_query_w_sessions(site, query),
           select:
             {fragment("toHour(toTimeZone(?, ?)) as hour", e.timestamp, ^site.timezone),
-             fragment("uniq(?)", e.user_id)},
+             uniq(e.user_id)},
           group_by: fragment("hour"),
           order_by: fragment("hour")
       )
@@ -116,7 +119,7 @@ defmodule Plausible.Stats.Clickhouse do
         from e in base_query_w_sessions(site, query),
           select: {
             fragment("dateDiff('minute', now(), ?) as relativeMinute", e.timestamp),
-            fragment("count(*)")
+            total()
           },
           group_by: fragment("relativeMinute"),
           order_by: fragment("relativeMinute")
@@ -129,32 +132,45 @@ defmodule Plausible.Stats.Clickhouse do
   end
 
   def bounce_rate(site, query) do
+    q = base_session_query(site, query) |> apply_page_as_entry_page(site, query)
+
     ClickhouseRepo.one(
-      from s in base_session_query(site, query),
-        select: fragment("round(sum(is_bounce * sign) / sum(sign) * 100)")
+      from s in q,
+        select: bounce_rate()
     ) || 0
   end
 
   def visit_duration(site, query) do
+    q = base_session_query(site, query) |> apply_page_as_entry_page(site, query)
+
     ClickhouseRepo.one(
-      from s in base_session_query(site, query),
-        select: fragment("round(avg(duration * sign))")
+      from s in q,
+        select: visit_duration()
     ) || 0
   end
 
   def total_pageviews(site, %Query{period: "realtime"} = query) do
     query = %Query{query | period: "30m"}
 
+    q = base_session_query(site, query) |> apply_page_as_entry_page(site, query)
+
     ClickhouseRepo.one(
-      from e in base_session_query(site, query),
+      from e in q,
         select: fragment("sum(sign * pageviews)")
+    )
+  end
+
+  def total_pageviews(site, query) do
+    ClickhouseRepo.one(
+      from e in base_query_w_sessions(site, query),
+        select: total()
     )
   end
 
   def total_events(site, query) do
     ClickhouseRepo.one(
       from e in base_query_w_sessions(site, query),
-        select: fragment("count(*) as events")
+        select: total()
     )
   end
 
@@ -166,29 +182,38 @@ defmodule Plausible.Stats.Clickhouse do
       from e in "events",
         where: e.domain == ^site.domain,
         where: e.timestamp >= ^first_datetime and e.timestamp < ^last_datetime,
-        group_by: e.name,
-        select: {e.name, fragment("count(*)")}
+        group_by: fragment("name"),
+        select: {
+          fragment("if(? = 'pageview', 'pageviews', 'custom_events') as name", e.name),
+          fragment("count(*)")
+        }
     )
-    |> Enum.map(fn {ev_name, count} ->
-      ev_name = if ev_name == "pageview", do: :pageviews, else: :custom_events
-      {ev_name, count}
-    end)
     |> Enum.into(%{})
   end
 
   def pageviews_and_visitors(site, query) do
+    {pageviews, visitors, _} = pageviews_and_visitors_with_sample_percent(site, query)
+    {pageviews, visitors}
+  end
+
+  def pageviews_and_visitors_with_sample_percent(site, query) do
     ClickhouseRepo.one(
       from e in base_query_w_sessions(site, query),
-        select: {fragment("count(*)"), fragment("uniq(user_id)")}
+        select: {total(), uniq(e.user_id), sample_percent()}
     )
   end
 
   def unique_visitors(site, query) do
+    {visitors, _} = unique_visitors_with_sample_percent(site, query)
+    visitors
+  end
+
+  def unique_visitors_with_sample_percent(site, query) do
     query = if query.period == "realtime", do: %Query{query | period: "30m"}, else: query
 
     ClickhouseRepo.one(
       from e in base_query_w_sessions(site, query),
-        select: fragment("uniq(user_id)")
+        select: {uniq(e.user_id), sample_percent()}
     )
   end
 
@@ -199,13 +224,13 @@ defmodule Plausible.Stats.Clickhouse do
       from s in base_query_w_sessions(site, query),
         where: s.referrer_source != "",
         group_by: s.referrer_source,
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(s.user_id)],
         limit: ^limit,
         offset: ^offset,
         select: %{
           name: s.referrer_source,
           url: fragment("any(?)", s.referrer),
-          count: fragment("uniq(?) as count", s.user_id)
+          count: uniq(s.user_id)
         }
     )
     |> Enum.map(fn ref ->
@@ -219,7 +244,7 @@ defmodule Plausible.Stats.Clickhouse do
     referrers =
       from(s in base_session_query(site, query),
         group_by: s.referrer_source,
-        order_by: [desc: fragment("count"), asc: fragment("min(start)")],
+        order_by: [desc: uniq(s.user_id), asc: fragment("min(start)")],
         limit: ^limit,
         offset: ^offset
       )
@@ -253,10 +278,9 @@ defmodule Plausible.Stats.Clickhouse do
                 s.referrer_source
               ),
             url: fragment("any(?)", s.referrer),
-            count: fragment("uniq(user_id) as count"),
-            bounce_rate:
-              fragment("round(sum(is_bounce * sign) / sum(sign) * 100) as bounce_rate"),
-            visit_duration: fragment("round(avg(duration * sign)) as visit_duration")
+            count: uniq(s.user_id),
+            bounce_rate: bounce_rate(),
+            visit_duration: visit_duration()
           }
         )
       else
@@ -271,7 +295,7 @@ defmodule Plausible.Stats.Clickhouse do
                 s.referrer_source
               ),
             url: fragment("any(?)", s.referrer),
-            count: fragment("uniq(user_id) as count")
+            count: uniq(s.user_id)
           }
         )
       end
@@ -282,20 +306,34 @@ defmodule Plausible.Stats.Clickhouse do
     end)
   end
 
-  defp filter_converted_sessions(db_query, site, %Query{filters: %{"goal" => goal}} = query)
-       when is_binary(goal) do
-    converted_sessions =
-      from(e in base_query(site, query),
-        select: %{session_id: e.session_id}
-      )
+  defp filter_converted_sessions(db_query, site, query) do
+    goal = query.filters["goal"]
+    page = query.filters["page"]
 
-    from(s in db_query,
-      join: cs in subquery(converted_sessions),
-      on: s.session_id == cs.session_id
-    )
+    if is_binary(goal) || is_binary(page) do
+      converted_sessions =
+        from(e in base_query(site, query),
+          select: %{session_id: fragment("DISTINCT ?", e.session_id)}
+        )
+
+      from(s in db_query,
+        join: cs in subquery(converted_sessions),
+        on: s.session_id == cs.session_id
+      )
+    else
+      db_query
+    end
   end
 
-  defp filter_converted_sessions(db_query, _site, _query), do: db_query
+  defp apply_page_as_entry_page(db_query, _site, query) do
+    page = query.filters["page"]
+
+    if is_binary(page) do
+      from(s in db_query, where: s.entry_page == ^page)
+    else
+      db_query
+    end
+  end
 
   def utm_mediums(site, query, limit \\ 9, page \\ 1, show_noref \\ false) do
     offset = (page - 1) * limit
@@ -304,14 +342,14 @@ defmodule Plausible.Stats.Clickhouse do
       from(
         s in base_session_query(site, query),
         group_by: s.utm_medium,
-        order_by: [desc: fragment("count"), asc: fragment("min(start)")],
+        order_by: [desc: uniq(s.user_id), asc: min(s.start)],
         limit: ^limit,
         offset: ^offset,
         select: %{
-          name: fragment("if(empty(?), ?, ?) as name", s.utm_medium, @no_ref, s.utm_medium),
-          count: fragment("uniq(user_id) as count"),
-          bounce_rate: fragment("round(sum(is_bounce * sign) / sum(sign) * 100)"),
-          visit_duration: fragment("round(avg(duration * sign))")
+          name: coalesce_string(s.utm_medium, @no_ref),
+          count: uniq(s.user_id),
+          bounce_rate: bounce_rate(),
+          visit_duration: visit_duration()
         }
       )
 
@@ -334,14 +372,14 @@ defmodule Plausible.Stats.Clickhouse do
       from(
         s in base_session_query(site, query),
         group_by: s.utm_campaign,
-        order_by: [desc: fragment("count"), asc: fragment("min(start)")],
+        order_by: [desc: uniq(s.user_id), asc: min(s.start)],
         limit: ^limit,
         offset: ^offset,
         select: %{
-          name: fragment("if(empty(?), ?, ?) as name", s.utm_campaign, @no_ref, s.utm_campaign),
-          count: fragment("uniq(user_id) as count"),
-          bounce_rate: fragment("round(sum(is_bounce * sign) / sum(sign) * 100)"),
-          visit_duration: fragment("round(avg(duration * sign))")
+          name: coalesce_string(s.utm_campaign, @no_ref),
+          count: uniq(s.user_id),
+          bounce_rate: bounce_rate(),
+          visit_duration: visit_duration()
         }
       )
 
@@ -364,14 +402,14 @@ defmodule Plausible.Stats.Clickhouse do
       from(
         s in base_session_query(site, query),
         group_by: s.utm_source,
-        order_by: [desc: fragment("count"), asc: fragment("min(start)")],
+        order_by: [desc: uniq(s.user_id), asc: min(s.start)],
         limit: ^limit,
         offset: ^offset,
         select: %{
-          name: fragment("if(empty(?), ?, ?) as name", s.utm_source, @no_ref, s.utm_source),
-          count: fragment("uniq(user_id) as count"),
-          bounce_rate: fragment("round(sum(is_bounce * sign) / sum(sign) * 100)"),
-          visit_duration: fragment("round(avg(duration * sign))")
+          name: coalesce_string(s.utm_source, @no_ref),
+          count: uniq(s.user_id),
+          bounce_rate: bounce_rate(),
+          visit_duration: visit_duration()
         }
       )
 
@@ -399,7 +437,7 @@ defmodule Plausible.Stats.Clickhouse do
         join: cs in subquery(converted_sessions),
         on: s.session_id == cs.session_id,
         where: s.referrer_source == ^referrer,
-        select: fragment("uniq(user_id) as visitors")
+        select: uniq(s.user_id)
     )
   end
 
@@ -411,7 +449,7 @@ defmodule Plausible.Stats.Clickhouse do
         s in base_session_query(site, query),
         group_by: s.referrer,
         where: s.referrer_source == ^referrer,
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(s.user_id)],
         limit: ^limit
       )
       |> filter_converted_sessions(site, query)
@@ -421,18 +459,17 @@ defmodule Plausible.Stats.Clickhouse do
         from(
           s in q,
           select: %{
-            name: fragment("if(empty(?), ?, ?) as name", s.referrer, @no_ref, s.referrer),
-            count: fragment("uniq(user_id) as count"),
-            bounce_rate:
-              fragment("round(sum(is_bounce * sign) / sum(sign) * 100) as bounce_rate"),
-            visit_duration: fragment("round(avg(duration * sign)) as visit_duration")
+            name: coalesce_string(s.referrer, @no_ref),
+            count: uniq(s.user_id),
+            bounce_rate: bounce_rate(),
+            visit_duration: visit_duration()
           }
         )
       else
         from(s in q,
           select: %{
-            name: fragment("if(empty(?), ?, ?) as name", s.referrer, @no_ref, s.referrer),
-            count: fragment("uniq(user_id) as count")
+            name: coalesce_string(s.referrer, @no_ref),
+            count: uniq(s.user_id)
           }
         )
       end
@@ -467,61 +504,101 @@ defmodule Plausible.Stats.Clickhouse do
       from s in base_query_w_sessions(site, query),
         where: s.referrer_source == ^referrer,
         group_by: s.referrer,
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(s.user_id)],
         limit: 100,
         select: %{
           name: s.referrer,
-          count: fragment("uniq(user_id) as count")
+          count: uniq(s.user_id)
         }
     )
   end
 
-  def entry_pages(site, query, limit, page \\ 1, include) do
+  def entry_pages(site, query, limit, page \\ 1) do
     offset = (page - 1) * limit
 
     q =
       from(
         s in base_session_query(site, query),
         group_by: s.entry_page,
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(s.user_id)],
         limit: ^limit,
         offset: ^offset,
         select: %{
           name: s.entry_page,
-          count: fragment("uniq(?) as count", s.user_id)
+          count: uniq(s.user_id),
+          entries: uniq(s.session_id),
+          visit_duration: visit_duration()
         }
       )
+      |> filter_converted_sessions(site, query)
+
+    ClickhouseRepo.all(q)
+  end
+
+  def exit_pages(site, query, limit, page \\ 1) do
+    offset = (page - 1) * limit
 
     q =
-      if query.filters["page"] do
-        page = query.filters["page"]
-        from(s in q, where: s.entry_page == ^page)
-      else
-        q
-      end
+      from(
+        s in base_session_query(site, query),
+        group_by: s.exit_page,
+        order_by: [desc: uniq(s.user_id)],
+        limit: ^limit,
+        offset: ^offset,
+        where: s.exit_page != "",
+        select: %{
+          name: s.exit_page,
+          count: uniq(s.user_id),
+          exits: uniq(s.session_id)
+        }
+      )
+      |> filter_converted_sessions(site, query)
 
-    pages = ClickhouseRepo.all(q)
+    result = ClickhouseRepo.all(q)
 
-    if "bounce_rate" in include do
-      bounce_rates = bounce_rates_by_page_url(site, query)
-      Enum.map(pages, fn url -> Map.put(url, :bounce_rate, bounce_rates[url[:name]]) end)
+    if Enum.count(result) > 0 do
+      pages = Enum.map(result, fn r -> r[:name] end)
+
+      event_q =
+        from(e in base_query_w_session_based_pageviews(site, query),
+          group_by: e.pathname,
+          where: fragment("? IN tuple(?)", e.pathname, ^pages),
+          where: e.name == "pageview",
+          select: {
+            e.pathname,
+            total()
+          }
+        )
+
+      total_pageviews = ClickhouseRepo.all(event_q) |> Enum.into(%{})
+
+      Enum.map(result, fn r ->
+        if Map.get(total_pageviews, r[:name]) do
+          exit_rate = r[:exits] / Map.get(total_pageviews, r[:name]) * 100
+          Map.put(r, :exit_rate, Float.floor(exit_rate))
+        else
+          Map.put(r, :exit_rate, nil)
+        end
+      end)
     else
-      pages
+      result
     end
   end
 
   def top_pages(site, %Query{period: "realtime"} = query, limit, page, _include) do
     offset = (page - 1) * limit
 
+    q = base_session_query(site, query) |> apply_page_as_entry_page(site, query)
+
     ClickhouseRepo.all(
-      from s in base_session_query(site, query),
+      from s in q,
         group_by: s.exit_page,
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(s.user_id)],
         limit: ^limit,
         offset: ^offset,
         select: %{
-          name: fragment("? as name", s.exit_page),
-          count: fragment("uniq(?) as count", s.user_id)
+          name: s.exit_page,
+          count: uniq(s.user_id)
         }
     )
   end
@@ -531,15 +608,15 @@ defmodule Plausible.Stats.Clickhouse do
 
     q =
       from(
-        e in base_query(site, query),
+        e in base_query_w_sessions(site, query),
         group_by: e.pathname,
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         limit: ^limit,
         offset: ^offset,
         select: %{
-          name: fragment("? as name", e.pathname),
-          count: fragment("uniq(?) as count", e.user_id),
-          pageviews: fragment("count(*) as pageviews")
+          name: e.pathname,
+          count: uniq(e.user_id),
+          pageviews: total()
         }
       )
 
@@ -554,15 +631,17 @@ defmodule Plausible.Stats.Clickhouse do
   end
 
   defp bounce_rates_by_page_url(site, query) do
+    q = base_session_query(site, query) |> apply_page_as_entry_page(site, query)
+
     ClickhouseRepo.all(
-      from s in base_session_query(site, query),
+      from s in q,
         group_by: s.entry_page,
-        order_by: [desc: fragment("total")],
+        order_by: [desc: total()],
         limit: 100,
         select: %{
           entry_page: s.entry_page,
-          total: fragment("count(*) as total"),
-          bounce_rate: fragment("round(sum(is_bounce * sign) / sum(sign) * 100) as bounce_rate")
+          total: total(),
+          bounce_rate: bounce_rate()
         }
     )
     |> Enum.map(fn row -> {row[:entry_page], row[:bounce_rate]} end)
@@ -582,10 +661,10 @@ defmodule Plausible.Stats.Clickhouse do
       from e in base_query_w_sessions(site, query),
         group_by: e.screen_size,
         where: e.screen_size != "",
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         select: %{
           name: e.screen_size,
-          count: fragment("uniq(user_id) as count")
+          count: uniq(e.user_id)
         }
     )
     |> add_percentages
@@ -596,10 +675,10 @@ defmodule Plausible.Stats.Clickhouse do
       from e in base_query_w_sessions(site, query),
         group_by: e.country_code,
         where: e.country_code != "\0\0",
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         select: %{
           name: e.country_code,
-          count: fragment("uniq(user_id) as count")
+          count: uniq(e.user_id)
         }
     )
     |> Enum.map(fn stat ->
@@ -617,10 +696,10 @@ defmodule Plausible.Stats.Clickhouse do
       from e in base_query_w_sessions(site, query),
         group_by: e.browser,
         where: e.browser != "",
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         select: %{
           name: e.browser,
-          count: fragment("uniq(user_id) as count")
+          count: uniq(e.user_id)
         }
     )
     |> add_percentages
@@ -632,10 +711,10 @@ defmodule Plausible.Stats.Clickhouse do
       from e in base_query_w_sessions(site, query),
         group_by: e.browser_version,
         where: e.browser_version != "",
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         select: %{
           name: e.browser_version,
-          count: fragment("uniq(user_id) as count")
+          count: uniq(e.user_id)
         }
     )
     |> add_percentages
@@ -647,10 +726,10 @@ defmodule Plausible.Stats.Clickhouse do
       from e in base_query_w_sessions(site, query),
         group_by: e.operating_system,
         where: e.operating_system != "",
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         select: %{
           name: e.operating_system,
-          count: fragment("uniq(user_id) as count")
+          count: uniq(e.user_id)
         }
     )
     |> add_percentages
@@ -662,10 +741,10 @@ defmodule Plausible.Stats.Clickhouse do
       from e in base_query_w_sessions(site, query),
         group_by: e.operating_system_version,
         where: e.operating_system_version != "",
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         select: %{
           name: e.operating_system_version,
-          count: fragment("uniq(user_id) as count")
+          count: uniq(e.user_id)
         }
     )
     |> add_percentages
@@ -674,8 +753,8 @@ defmodule Plausible.Stats.Clickhouse do
 
   def current_visitors(site, query) do
     Plausible.ClickhouseRepo.one(
-      from s in base_query(site, query),
-        select: fragment("uniq(user_id)")
+      from e in base_query(site, query),
+        select: uniq(e.user_id)
     )
   end
 
@@ -731,22 +810,22 @@ defmodule Plausible.Stats.Clickhouse do
       ClickhouseRepo.all(
         from e in base_query_w_sessions(site, query),
           where: fragment("not has(meta.key, ?)", ^key),
-          order_by: [desc: fragment("count")],
+          order_by: [desc: uniq(e.user_id)],
           select: %{
             name: "(none)",
-            count: fragment("uniq(user_id) as count"),
-            total_count: fragment("count(*) as total_count")
+            count: uniq(e.user_id),
+            total_count: total()
           }
       )
     else
       ClickhouseRepo.all(
         from [e, meta: meta] in base_query_w_sessions(site, query),
           group_by: meta.value,
-          order_by: [desc: fragment("count")],
+          order_by: [desc: uniq(e.user_id)],
           select: %{
             name: meta.value,
-            count: fragment("uniq(user_id) as count"),
-            total_count: fragment("count(*) as total_count")
+            count: uniq(e.user_id),
+            total_count: total()
           }
       )
     end
@@ -759,8 +838,8 @@ defmodule Plausible.Stats.Clickhouse do
           where: fragment("not has(?.key, ?)", e.meta, ^key),
           select: %{
             name: "(none)",
-            count: fragment("uniq(?) as count", e.user_id),
-            total_count: fragment("count(*) as total_count")
+            count: uniq(e.user_id),
+            total_count: total()
           }
       )
 
@@ -770,11 +849,11 @@ defmodule Plausible.Stats.Clickhouse do
           inner_lateral_join: meta in fragment("meta as m"),
           where: meta.key == ^key,
           group_by: meta.value,
-          order_by: [desc: fragment("count")],
+          order_by: [desc: uniq(e.user_id)],
           select: %{
             name: meta.value,
-            count: fragment("uniq(user_id) as count"),
-            total_count: fragment("count(*) as total_count")
+            count: uniq(e.user_id),
+            total_count: total()
           }
       )
 
@@ -811,11 +890,11 @@ defmodule Plausible.Stats.Clickhouse do
     ClickhouseRepo.all(
       from e in base_query_w_sessions(site, query),
         group_by: e.name,
-        order_by: [desc: fragment("count")],
+        order_by: [desc: uniq(e.user_id)],
         select: %{
           name: ^goal,
-          count: fragment("uniq(user_id) as count"),
-          total_count: fragment("count(*) as total_count")
+          count: uniq(e.user_id),
+          total_count: total()
         }
     )
   end
@@ -842,8 +921,8 @@ defmodule Plausible.Stats.Clickhouse do
           group_by: e.name,
           select: %{
             name: e.name,
-            count: fragment("uniq(user_id) as count"),
-            total_count: fragment("count(*) as total_count")
+            count: uniq(e.user_id),
+            total_count: total()
           }
         )
 
@@ -854,24 +933,37 @@ defmodule Plausible.Stats.Clickhouse do
   end
 
   defp fetch_pageview_goals(goals, site, query) do
-    pages =
+    goals =
       Enum.map(goals, fn goal -> goal.page_path end)
       |> Enum.filter(& &1)
 
-    if Enum.count(pages) > 0 do
-      q =
-        from(
-          e in base_query_w_sessions(site, query),
-          where: fragment("? IN tuple(?)", e.pathname, ^pages),
-          group_by: e.pathname,
-          select: %{
-            name: fragment("concat('Visit ', ?) as name", e.pathname),
-            count: fragment("uniq(user_id) as count"),
-            total_count: fragment("count(*) as total_count")
-          }
-        )
+    if Enum.count(goals) > 0 do
+      regex_goals =
+        Enum.map(goals, fn g ->
+          "^#{g}\/?$"
+          |> String.replace(~r/\*\*/, ".*")
+          |> String.replace(~r/(?<!\.)\*/, "[^/]*")
+        end)
 
-      ClickhouseRepo.all(q)
+      from(
+        e in base_query_w_sessions(site, query),
+        where:
+          fragment(
+            "notEmpty(multiMatchAllIndices(?, array(?)) as indices)",
+            e.pathname,
+            ^regex_goals
+          ),
+        select: %{
+          index: fragment("arrayJoin(indices) as index"),
+          count: uniq(e.user_id),
+          total_count: total()
+        },
+        group_by: fragment("index")
+      )
+      |> ClickhouseRepo.all()
+      |> Enum.map(fn x ->
+        Map.put(x, :name, "Visit #{Enum.at(goals, x[:index] - 1)}") |> Map.delete(:index)
+      end)
     else
       []
     end
@@ -886,6 +978,7 @@ defmodule Plausible.Stats.Clickhouse do
 
     sessions_q =
       from(s in "sessions",
+        hints: ["SAMPLE 10000000"],
         where: s.domain == ^site.domain,
         where: s.timestamp >= ^first_datetime and s.start < ^last_datetime,
         select: %{session_id: s.session_id}
@@ -980,8 +1073,25 @@ defmodule Plausible.Stats.Clickhouse do
         sessions_q
       end
 
+    sessions_q =
+      if query.filters["entry_page"] do
+        entry_page = query.filters["entry_page"]
+        from(s in sessions_q, where: s.entry_page == ^entry_page)
+      else
+        sessions_q
+      end
+
+    sessions_q =
+      if query.filters["exit_page"] do
+        exit_page = query.filters["exit_page"]
+        from(s in sessions_q, where: s.exit_page == ^exit_page)
+      else
+        sessions_q
+      end
+
     q =
       from(e in "events",
+        hints: ["SAMPLE 10000000"],
         where: e.domain == ^site.domain,
         where: e.timestamp >= ^first_datetime and e.timestamp < ^last_datetime
       )
@@ -990,7 +1100,8 @@ defmodule Plausible.Stats.Clickhouse do
       if query.filters["source"] || query.filters['referrer'] || query.filters["utm_medium"] ||
            query.filters["utm_source"] || query.filters["utm_campaign"] || query.filters["screen"] ||
            query.filters["browser"] || query.filters["browser_version"] || query.filters["os"] ||
-           query.filters["os_version"] || query.filters["country"] do
+           query.filters["os_version"] || query.filters["country"] || query.filters["entry_page"] ||
+           query.filters["exit_page"] do
         from(
           e in q,
           join: sq in subquery(sessions_q),
@@ -1029,23 +1140,40 @@ defmodule Plausible.Stats.Clickhouse do
     end
   end
 
-  defp base_query_w_sessions(site, query) do
-    q = base_query_w_sessions_bare(site, query)
+  defp base_query_w_session_based_pageviews(site, query) do
+    {first_datetime, last_datetime} = utc_boundaries(query, site.timezone)
 
-    {goal_event, path} = event_name_for_goal(query)
+    sessions_q = base_session_query(site, query) |> filter_converted_sessions(site, query)
+
+    sessions_q =
+      from(s in sessions_q,
+        select: %{session_id: s.session_id}
+      )
 
     q =
-      if goal_event do
-        from(e in q, where: e.name == ^goal_event)
-      else
-        from(e in q, where: e.name == "pageview")
-      end
+      from(e in "events",
+        hints: ["SAMPLE 10000000"],
+        where: e.domain == ^site.domain,
+        where: e.timestamp >= ^first_datetime and e.timestamp < ^last_datetime
+      )
 
-    if path do
-      from(e in q, where: e.pathname == ^path)
+    if query.filters["source"] || query.filters['referrer'] || query.filters["utm_medium"] ||
+         query.filters["utm_source"] || query.filters["utm_campaign"] || query.filters["screen"] ||
+         query.filters["browser"] || query.filters["browser_version"] || query.filters["os"] ||
+         query.filters["os_version"] || query.filters["country"] || query.filters["entry_page"] ||
+         query.filters["exit_page"] || query.filters["page"] || query.filters["goal"] do
+      from(
+        e in q,
+        join: sq in subquery(sessions_q),
+        on: e.session_id == sq.session_id
+      )
     else
       q
     end
+  end
+
+  defp base_query_w_sessions(site, query) do
+    base_query_w_sessions_bare(site, query) |> include_goal_conversions(query)
   end
 
   defp base_session_query(site, query) do
@@ -1053,6 +1181,7 @@ defmodule Plausible.Stats.Clickhouse do
 
     q =
       from(s in "sessions",
+        hints: ["SAMPLE 10000000"],
         where: s.domain == ^site.domain,
         where: s.timestamp >= ^first_datetime and s.start < ^last_datetime
       )
@@ -1139,9 +1268,17 @@ defmodule Plausible.Stats.Clickhouse do
       end
 
     q =
-      if query.filters["page"] do
-        page = query.filters["page"]
-        from(s in q, where: s.entry_page == ^page)
+      if query.filters["entry_page"] do
+        entry_page = query.filters["entry_page"]
+        from(s in q, where: s.entry_page == ^entry_page)
+      else
+        q
+      end
+
+    q =
+      if query.filters["exit_page"] do
+        exit_page = query.filters["exit_page"]
+        from(s in q, where: s.exit_page == ^exit_page)
       else
         q
       end
@@ -1154,12 +1291,12 @@ defmodule Plausible.Stats.Clickhouse do
     end
   end
 
-  defp base_query(site, query) do
+  defp base_query_bare(site, query) do
     {first_datetime, last_datetime} = utc_boundaries(query, site.timezone)
-    {goal_event, path} = event_name_for_goal(query)
 
     q =
       from(e in "events",
+        hints: ["SAMPLE 10000000"],
         where: e.domain == ^site.domain,
         where: e.timestamp >= ^first_datetime and e.timestamp < ^last_datetime
       )
@@ -1252,38 +1389,28 @@ defmodule Plausible.Stats.Clickhouse do
         q
       end
 
-    q =
-      if query.filters["props"] do
-        [{key, val}] = query.filters["props"] |> Enum.into([])
+    if query.filters["props"] do
+      [{key, val}] = query.filters["props"] |> Enum.into([])
 
-        if val == "(none)" do
-          from(
-            e in q,
-            where: fragment("not has(meta.key, ?)", ^key)
-          )
-        else
-          from(
-            e in q,
-            inner_lateral_join: meta in fragment("meta as m"),
-            where: meta.key == ^key and meta.value == ^val
-          )
-        end
+      if val == "(none)" do
+        from(
+          e in q,
+          where: fragment("not has(meta.key, ?)", ^key)
+        )
       else
-        q
+        from(
+          e in q,
+          inner_lateral_join: meta in fragment("meta as m"),
+          where: meta.key == ^key and meta.value == ^val
+        )
       end
-
-    q =
-      if path do
-        from(e in q, where: e.pathname == ^path)
-      else
-        q
-      end
-
-    if goal_event do
-      from(e in q, where: e.name == ^goal_event)
     else
-      from(e in q, where: e.name == "pageview")
+      q
     end
+  end
+
+  defp base_query(site, query) do
+    base_query_bare(site, query) |> include_goal_conversions(query)
   end
 
   defp utc_boundaries(%Query{period: "30m"}, _timezone) do
@@ -1326,6 +1453,32 @@ defmodule Plausible.Stats.Clickhouse do
 
       _ ->
         {nil, nil}
+    end
+  end
+
+  defp include_goal_conversions(db_query, query) do
+    {goal_event, path} = event_name_for_goal(query)
+
+    q =
+      if goal_event do
+        from(e in db_query, where: e.name == ^goal_event)
+      else
+        from(e in db_query, where: e.name == "pageview")
+      end
+
+    if path do
+      if String.match?(path, ~r/\*/) do
+        path_regex =
+          "^#{path}\/?$"
+          |> String.replace(~r/\*\*/, ".*")
+          |> String.replace(~r/(?<!\.)\*/, "[^/]*")
+
+        from(e in q, where: fragment("match(?, ?)", e.pathname, ^path_regex))
+      else
+        from(e in q, where: e.pathname == ^path)
+      end
+    else
+      q
     end
   end
 end

@@ -40,7 +40,10 @@ COPY lib ./lib
 
 RUN npm run deploy --prefix ./assets && \
     npm run deploy --prefix ./tracker && \
-    mix phx.digest priv/static
+    mix phx.digest priv/static && \
+    mix download_country_database && \
+# https://hexdocs.pm/sentry/Sentry.Sources.html#module-source-code-storage
+    mix sentry_recompile
 
 WORKDIR /app
 COPY rel rel
@@ -65,4 +68,5 @@ RUN chown -R plausibleuser:plausibleuser /app
 USER plausibleuser
 WORKDIR /app
 ENTRYPOINT ["/entrypoint.sh"]
+EXPOSE 8000
 CMD ["run"]

@@ -1,7 +1,6 @@
 defmodule Plausible.Session.Store do
   use GenServer
   use Plausible.Repo
-  import Ecto.Query, only: [from: 2]
   require Logger
 
   @garbage_collect_interval_milliseconds 60 * 1000
@@ -14,29 +13,7 @@ defmodule Plausible.Session.Store do
     buffer = Keyword.get(opts, :buffer, Plausible.Session.WriteBuffer)
     timer = Process.send_after(self(), :garbage_collect, @garbage_collect_interval_milliseconds)
 
-    latest_sessions =
-      from(
-        s in "sessions",
-        where: s.timestamp >= fragment("now() - INTERVAL ? SECOND", ^forget_session_after()),
-        group_by: s.session_id,
-        select: %{session_id: s.session_id, timestamp: max(s.timestamp)}
-      )
-
-    sessions =
-      try do
-        Plausible.ClickhouseRepo.all(
-          from s in Plausible.ClickhouseSession,
-            join: ls in subquery(latest_sessions),
-            on: s.session_id == ls.session_id and s.timestamp == ls.timestamp,
-            order_by: s.timestamp
-        )
-        |> Enum.map(fn s -> {s.user_id, s} end)
-        |> Enum.into(%{})
-      rescue
-        _e -> %{}
-      end
-
-    {:ok, %{timer: timer, sessions: sessions, buffer: buffer}}
+    {:ok, %{timer: timer, sessions: %{}, buffer: buffer}}
   end
 
   def on_event(event, prev_user_id, pid \\ __MODULE__) do
@@ -48,7 +25,11 @@ defmodule Plausible.Session.Store do
         _from,
         %{sessions: sessions, buffer: buffer} = state
       ) do
-    found_session = sessions[event.user_id] || (prev_user_id && sessions[prev_user_id])
+    session_key = {event.domain, event.user_id}
+
+    found_session =
+      sessions[session_key] || (prev_user_id && sessions[{event.domain, prev_user_id}])
+
     active = is_active?(found_session, event)
 
     updated_sessions =
@@ -56,21 +37,44 @@ defmodule Plausible.Session.Store do
         found_session && active ->
           new_session = update_session(found_session, event)
           buffer.insert([%{new_session | sign: 1}, %{found_session | sign: -1}])
-          Map.put(sessions, event.user_id, new_session)
+          Map.put(sessions, session_key, new_session)
 
         found_session && !active ->
           new_session = new_session_from_event(event)
           buffer.insert([new_session])
-          Map.put(sessions, event.user_id, new_session)
+          Map.put(sessions, session_key, new_session)
 
         true ->
           new_session = new_session_from_event(event)
           buffer.insert([new_session])
-          Map.put(sessions, event.user_id, new_session)
+          Map.put(sessions, session_key, new_session)
       end
 
-    session_id = updated_sessions[event.user_id].session_id
+    session_id = updated_sessions[session_key].session_id
     {:reply, session_id, %{state | sessions: updated_sessions}}
+  end
+
+  def reconcile_event(sessions, event) do
+    session_key = {event.domain, event.user_id}
+    found_session = sessions[session_key]
+    active = is_active?(found_session, event)
+
+    updated_sessions =
+      cond do
+        found_session && active ->
+          new_session = update_session(found_session, event)
+          Map.put(sessions, session_key, new_session)
+
+        found_session && !active ->
+          new_session = new_session_from_event(event)
+          Map.put(sessions, session_key, new_session)
+
+        true ->
+          new_session = new_session_from_event(event)
+          Map.put(sessions, session_key, new_session)
+      end
+
+    updated_sessions
   end
 
   defp is_active?(session, event) do

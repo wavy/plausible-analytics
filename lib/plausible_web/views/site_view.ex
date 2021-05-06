@@ -1,5 +1,6 @@
 defmodule PlausibleWeb.SiteView do
   use PlausibleWeb, :view
+  import Phoenix.Pagination.HTML
 
   def admin_email do
     Application.get_env(:plausible, :admin_email)
@@ -21,8 +22,8 @@ defmodule PlausibleWeb.SiteView do
     name
   end
 
-  def shared_link_dest(link) do
-    plausible_url() <> "/share/" <> link.slug
+  def shared_link_dest(site, link) do
+    Plausible.Sites.shared_link_url(site, link)
   end
 
   def snippet(site) do

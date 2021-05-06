@@ -143,7 +143,7 @@ defmodule PlausibleWeb.AuthController do
         url = PlausibleWeb.Endpoint.url() <> "/password/reset?token=#{token}"
         Logger.debug("PASSWORD RESET LINK: " <> url)
         email_template = PlausibleWeb.Email.password_reset_email(email, url)
-        Plausible.Mailer.deliver_now(email_template)
+        Plausible.Mailer.deliver_now!(email_template)
 
         render(conn, "password_reset_request_success.html",
           email: email,
@@ -298,6 +298,7 @@ defmodule PlausibleWeb.AuthController do
       Plausible.Billing.usage_breakdown(conn.assigns[:current_user])
 
     render(conn, "user_settings.html",
+      user: conn.assigns[:current_user] |> Repo.preload(:api_keys),
       changeset: changeset,
       subscription: conn.assigns[:current_user].subscription,
       theme: conn.assigns[:current_user].theme || "system",
@@ -312,7 +313,7 @@ defmodule PlausibleWeb.AuthController do
     case Repo.update(changes) do
       {:ok, _user} ->
         conn
-        |> put_flash(:success, "Account settings saved succesfully")
+        |> put_flash(:success, "Account settings saved successfully")
         |> redirect(to: "/settings")
 
       {:error, changeset} ->
@@ -323,15 +324,48 @@ defmodule PlausibleWeb.AuthController do
     end
   end
 
+  def new_api_key(conn, _params) do
+    key = :crypto.strong_rand_bytes(64) |> Base.url_encode64() |> binary_part(0, 64)
+    changeset = Auth.ApiKey.changeset(%Auth.ApiKey{}, %{key: key})
+
+    render(conn, "new_api_key.html",
+      changeset: changeset,
+      layout: {PlausibleWeb.LayoutView, "focus.html"}
+    )
+  end
+
+  def create_api_key(conn, %{"api_key" => key_params}) do
+    api_key = %Auth.ApiKey{user_id: conn.assigns[:current_user].id}
+    changeset = Auth.ApiKey.changeset(api_key, key_params)
+
+    case Repo.insert(changeset) do
+      {:ok, _api_key} ->
+        conn
+        |> put_flash(:success, "API key created successfully")
+        |> redirect(to: "/settings#api-keys")
+
+      {:error, changeset} ->
+        render(conn, "new_api_key.html",
+          changeset: changeset,
+          layout: {PlausibleWeb.LayoutView, "focus.html"}
+        )
+    end
+  end
+
+  def delete_api_key(conn, %{"id" => id}) do
+    Repo.get_by(Auth.ApiKey, id: id)
+    |> Repo.delete!()
+
+    conn
+    |> put_flash(:success, "API key revoked successfully")
+    |> redirect(to: "/settings#api-keys")
+  end
+
   def delete_me(conn, params) do
     user =
       conn.assigns[:current_user]
       |> Repo.preload(:sites)
       |> Repo.preload(:subscription)
-
-    for site_membership <- user.site_memberships do
-      Repo.delete!(site_membership)
-    end
 
     for site <- user.sites do
       Repo.delete!(site)
@@ -343,11 +377,13 @@ defmodule PlausibleWeb.AuthController do
     logout(conn, params)
   end
 
-  def logout(conn, _params) do
+  def logout(conn, params) do
+    redirect_to = Map.get(params, "redirect", "/")
+
     conn
     |> configure_session(drop: true)
     |> delete_resp_cookie("logged_in")
-    |> redirect(to: "/")
+    |> redirect(to: redirect_to)
   end
 
   def google_auth_callback(conn, %{"code" => code, "state" => site_id}) do

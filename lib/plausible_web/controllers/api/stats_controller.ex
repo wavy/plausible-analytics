@@ -1,16 +1,16 @@
 defmodule PlausibleWeb.Api.StatsController do
   use PlausibleWeb, :controller
   use Plausible.Repo
+  use Plug.ErrorHandler
   alias Plausible.Stats.Clickhouse, as: Stats
   alias Plausible.Stats.Query
-  plug PlausibleWeb.AuthorizeStatsPlug
 
   def main_graph(conn, params) do
     site = conn.assigns[:site]
     query = Query.from(site.timezone, params)
 
     plot_task = Task.async(fn -> Stats.calculate_plot(site, query) end)
-    top_stats = fetch_top_stats(site, query)
+    {top_stats, sample_percent} = fetch_top_stats(site, query)
     {plot, labels, present_index} = Task.await(plot_task)
 
     json(conn, %{
@@ -18,12 +18,13 @@ defmodule PlausibleWeb.Api.StatsController do
       labels: labels,
       present_index: present_index,
       top_stats: top_stats,
-      interval: query.step_type
+      interval: query.interval,
+      sample_percent: sample_percent
     })
   end
 
   defp fetch_top_stats(site, %Query{period: "realtime"} = query) do
-    [
+    stats = [
       %{
         name: "Current visitors",
         count: Stats.current_visitors(site, query)
@@ -37,6 +38,8 @@ defmodule PlausibleWeb.Api.StatsController do
         count: Stats.total_pageviews(site, query)
       }
     ]
+
+    {stats, 100}
   end
 
   defp fetch_top_stats(site, %Query{filters: %{"goal" => goal}} = query) when is_binary(goal) do
@@ -44,7 +47,7 @@ defmodule PlausibleWeb.Api.StatsController do
     prev_query = Query.shift_back(query, site)
     unique_visitors = Stats.unique_visitors(site, %{query | filters: total_filter})
     prev_unique_visitors = Stats.unique_visitors(site, %{prev_query | filters: total_filter})
-    converted_visitors = Stats.unique_visitors(site, query)
+    {converted_visitors, sample_percent} = Stats.unique_visitors_with_sample_percent(site, query)
     prev_converted_visitors = Stats.unique_visitors(site, prev_query)
     completions = Stats.total_events(site, query)
     prev_completions = Stats.total_events(site, prev_query)
@@ -52,7 +55,7 @@ defmodule PlausibleWeb.Api.StatsController do
     conversion_rate = calculate_cr(unique_visitors, converted_visitors)
     prev_conversion_rate = calculate_cr(prev_unique_visitors, prev_converted_visitors)
 
-    [
+    stats = [
       %{
         name: "Unique visitors",
         count: unique_visitors,
@@ -74,11 +77,16 @@ defmodule PlausibleWeb.Api.StatsController do
         change: percent_change(prev_conversion_rate, conversion_rate)
       }
     ]
+
+    {stats, sample_percent}
   end
 
   defp fetch_top_stats(site, query) do
     prev_query = Query.shift_back(query, site)
-    {pageviews, visitors} = Stats.pageviews_and_visitors(site, query)
+
+    {pageviews, visitors, sample_percent} =
+      Stats.pageviews_and_visitors_with_sample_percent(site, query)
+
     {prev_pageviews, prev_visitors} = Stats.pageviews_and_visitors(site, prev_query)
     bounce_rate = Stats.bounce_rate(site, query)
     prev_bounce_rate = Stats.bounce_rate(site, prev_query)
@@ -91,26 +99,29 @@ defmodule PlausibleWeb.Api.StatsController do
 
         %{
           name: "Visit duration",
-          count: duration,
+          duration: duration,
           change: percent_change(prev_duration, duration)
         }
       end
 
-    [
-      %{
-        name: "Unique visitors",
-        count: visitors,
-        change: percent_change(prev_visitors, visitors)
-      },
-      %{
-        name: "Total pageviews",
-        count: pageviews,
-        change: percent_change(prev_pageviews, pageviews)
-      },
-      %{name: "Bounce rate", percentage: bounce_rate, change: change_bounce_rate},
-      visit_duration
-    ]
-    |> Enum.filter(& &1)
+    stats =
+      [
+        %{
+          name: "Unique visitors",
+          count: visitors,
+          change: percent_change(prev_visitors, visitors)
+        },
+        %{
+          name: "Total pageviews",
+          count: pageviews,
+          change: percent_change(prev_pageviews, pageviews)
+        },
+        %{name: "Bounce rate", percentage: bounce_rate, change: change_bounce_rate},
+        visit_duration
+      ]
+      |> Enum.filter(& &1)
+
+    {stats, sample_percent}
   end
 
   defp percent_change(old_count, new_count) do
@@ -222,11 +233,19 @@ defmodule PlausibleWeb.Api.StatsController do
   def entry_pages(conn, params) do
     site = conn.assigns[:site]
     query = Query.from(site.timezone, params)
-    include = if params["include"], do: String.split(params["include"], ","), else: []
     limit = if params["limit"], do: String.to_integer(params["limit"])
     page = if params["page"], do: String.to_integer(params["page"])
 
-    json(conn, Stats.entry_pages(site, query, limit || 9, page || 1, include))
+    json(conn, Stats.entry_pages(site, query, limit || 9, page || 1))
+  end
+
+  def exit_pages(conn, params) do
+    site = conn.assigns[:site]
+    query = Query.from(site.timezone, params)
+    limit = if params["limit"], do: String.to_integer(params["limit"])
+    page = if params["page"], do: String.to_integer(params["page"])
+
+    json(conn, Stats.exit_pages(site, query, limit || 9, page || 1))
   end
 
   def countries(conn, params) do
@@ -317,4 +336,8 @@ defmodule PlausibleWeb.Api.StatsController do
   end
 
   defp google_api(), do: Application.fetch_env!(:plausible, :google_api)
+
+  def handle_errors(conn, %{kind: kind, reason: reason}) do
+    json(conn, %{error: Exception.format_banner(kind, reason)})
+  end
 end

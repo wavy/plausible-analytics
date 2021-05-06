@@ -23,7 +23,7 @@ import { navigateToQuery, QueryLink, QueryButton } from "./query";
 class DatePicker extends React.Component {
   constructor(props) {
     super(props);
-    this.handleKeyup = this.handleKeyup.bind(this);
+    this.handleKeydown = this.handleKeydown.bind(this);
     this.handleClick = this.handleClick.bind(this);
     this.openCalendar = this.openCalendar.bind(this);
     this.open = this.open.bind(this);
@@ -31,19 +31,20 @@ class DatePicker extends React.Component {
   }
 
   componentDidMount() {
-    document.addEventListener("keyup", this.handleKeyup);
+    document.addEventListener("keydown", this.handleKeydown);
     document.addEventListener("mousedown", this.handleClick, false);
   }
 
   componentWillUnmount() {
-    document.removeEventListener("keyup", this.handleKeyup);
+    document.removeEventListener("keydown", this.handleKeydown);
     document.removeEventListener("mousedown", this.handleClick, false);
   }
 
-  handleKeyup(e) {
+  handleKeydown(e) {
     const { query, history } = this.props;
 
-    if (e.ctrlKey || e.metaKey || e.altKey) return
+    if (e.target.tagName === 'INPUT') return true;
+    if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.keyCode === 229) return;
 
     const newSearch = {
       period: false,
@@ -100,11 +101,11 @@ class DatePicker extends React.Component {
 
     this.setState({open: false});
 
-    const keys = ['d', 'r', 'w', 'm', 'y'];
-    const redirects = [{date: false, period: 'day'}, {period: 'realtime'}, {date: false, period: '7d'}, {date: false, period: 'month'}, {date: false, period: '12mo'}];
+    const keys = ['d', 'r', 'w', 'm', 'y', 't', 's'];
+    const redirects = [{date: false, period: 'day'}, {period: 'realtime'}, {date: false, period: '7d'}, {date: false, period: 'month'}, {date: false, period: '12mo'}, {date: false, period: '30d'}, {date: false, period: '6mo'}];
 
     if (keys.includes(e.key.toLowerCase())) {
-      navigateToQuery(history, query, {...newSearch, ...(redirects[keys.indexOf(e.key) % 5])});
+      navigateToQuery(history, query, {...newSearch, ...(redirects[keys.indexOf(e.key.toLowerCase())])});
     } else if (e.key.toLowerCase() === 'c') {
       this.setState({mode: 'calendar', open: true}, this.openCalendar);
     } else if (newSearch.date) {
@@ -294,7 +295,7 @@ class DatePicker extends React.Component {
       boldClass = query.period === period ? "font-bold" : "";
     }
 
-    const date = opts.date ? formatISO(opts.date) : false;
+    opts.date = opts.date ? formatISO(opts.date) : false;
 
     const keybinds = {
       'Today': 'D',
@@ -302,11 +303,13 @@ class DatePicker extends React.Component {
       'Last 7 days': 'W',
       'Month to Date': 'M',
       'Last 12 months': 'Y',
+      'Last 6 months': 'S',
+      'Last 30 days': 'T',
     };
 
     return (
       <QueryLink
-        to={{from: false, to: false, date, period, ...opts}}
+        to={{from: false, to: false, period, ...opts}}
         onClick={this.close.bind(this)}
         query={this.props.query}
         className={`${boldClass  } px-4 py-2 md:text-sm leading-tight hover:bg-gray-100

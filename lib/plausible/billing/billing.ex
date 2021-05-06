@@ -1,6 +1,7 @@
 defmodule Plausible.Billing do
   use Plausible.Repo
   alias Plausible.Billing.{Subscription, PaddleApi}
+  use Plausible.ClickhouseRepo
 
   def active_subscription_for(user_id) do
     Repo.get_by(Subscription, user_id: user_id, status: "active")
@@ -65,7 +66,8 @@ defmodule Plausible.Billing do
       changeset =
         Subscription.changeset(subscription, %{
           next_bill_amount: amount,
-          next_bill_date: api_subscription["next_payment"]["date"]
+          next_bill_date: api_subscription["next_payment"]["date"],
+          last_bill_date: api_subscription["last_payment"]["date"]
         })
 
       Repo.update(changeset)
@@ -133,15 +135,71 @@ defmodule Plausible.Billing do
     pageviews + custom_events
   end
 
+  defp get_usage_for_billing_cycle(user, cycle) do
+    domains = Enum.map(user.sites, & &1.domain)
+
+    ClickhouseRepo.one(
+      from e in "events",
+        where: e.domain in ^domains,
+        where: fragment("toDate(?)", e.timestamp) >= ^cycle.first,
+        where: fragment("toDate(?)", e.timestamp) <= ^cycle.last,
+        select: fragment("count(*)")
+    )
+  end
+
+  def last_two_billing_months_usage(user, today \\ Timex.today()) do
+    {first, second} = last_two_billing_cycles(user, today)
+    user = Repo.preload(user, :sites)
+
+    {
+      get_usage_for_billing_cycle(user, first),
+      get_usage_for_billing_cycle(user, second)
+    }
+  end
+
+  def last_two_billing_cycles(user, today \\ Timex.today()) do
+    last_bill_date = user.subscription.last_bill_date
+
+    normalized_last_bill_date =
+      Timex.shift(last_bill_date,
+        months: Timex.diff(today, last_bill_date, :months)
+      )
+
+    {
+      Date.range(
+        Timex.shift(normalized_last_bill_date, months: -2),
+        Timex.shift(normalized_last_bill_date, days: -1, months: -1)
+      ),
+      Date.range(
+        Timex.shift(normalized_last_bill_date, months: -1),
+        Timex.shift(normalized_last_bill_date, days: -1)
+      )
+    }
+  end
+
   def usage_breakdown(user) do
     user = Repo.preload(user, :sites)
 
     Enum.reduce(user.sites, {0, 0}, fn site, {pageviews, custom_events} ->
       usage = Plausible.Stats.Clickhouse.usage(site)
 
-      {pageviews + Map.get(usage, :pageviews, 0),
-       custom_events + Map.get(usage, :custom_events, 0)}
+      {pageviews + Map.get(usage, "pageviews", 0),
+       custom_events + Map.get(usage, "custom_events", 0)}
     end)
+  end
+
+  @doc """
+  Returns the number of sites that an account is allowed to have. Accounts for
+  grandfathering old accounts to unlimited websites and ignores site limit on self-hosted
+  installations.
+  """
+  @limit_accounts_since ~D[2021-05-05]
+  def sites_limit(user) do
+    cond do
+      Timex.before?(user.inserted_at, @limit_accounts_since) -> nil
+      Application.get_env(:plausible, :is_selfhost) -> nil
+      true -> Application.get_env(:plausible, :site_limit)
+    end
   end
 
   defp format_subscription(params) do
